@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Inventario Pastelería</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 16px; margin-top: 40px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
+  form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input, select, button { padding: 8px; font-size: 14px; }
+  button { cursor: pointer; background: #222; color: #fff; border: none; border-radius: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
+  .alerta { color: #b00020; font-weight: bold; }
+  .ok { color: #2e7d32; }
+  #log { margin-top: 15px; font-size: 13px; color: #555; min-height: 20px; }
+  .badge-envio { background: #fff3cd; padding: 4px 8px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Inventario — Pastelería (ejercicio)</h1>
+
+<h2>Comprar (registrar lote nuevo)</h2>
+<form id="formComprar">
+  <select id="c_producto" required></select>
+  <span id="c_duracion_oficial" style="font-size:12px;color:#777"></span>
+  <input type="text" inputmode="decimal" id="c_cantidad" placeholder="Cantidad" required>
+  <input type="date" id="c_fecha" required>
+  <button type="submit">Registrar compra</button>
+</form>
+
+<h2>Usar (consumo diario)</h2>
+<form id="formUsar">
+  <select id="u_producto" required></select>
+  <input type="text" inputmode="decimal" id="u_cantidad" placeholder="Cantidad" required>
+  <input type="date" id="u_fecha" required>
+  <button type="submit">Registrar uso</button>
+</form>
+
+<div id="log"></div>
+
+<h2>Resumen de stock</h2>
+<table id="tablaResumen">
+  <thead>
+    <tr><th>Producto</th><th>Stock actual</th><th>Lote más próximo a vencer</th><th>Vence</th><th>Estado</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+// ====== CONFIG ======
+const SUPABASE_URL = 'https://ejwvilwqahblibthcnkd.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVqd3ZpbHdxYWhibGlidGhjbmtkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNzM0NjQsImV4cCI6MjA5ODc0OTQ2NH0.5OjfElUeHrMS0JSmbYmMp0jgy_gc6X1Iv60WqdLSDYE';
+const MAKE_WEBHOOK_URL = 'https://hook.us2.make.com/09uyblxh1nw6j75af1ox6azirwoapb59';
+
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+let productosConfig = [];
+
+// ====== INIT ======
+let inicializado = false;
+async function init() {
+  if (inicializado) return;
+  inicializado = true;
+  const { data, error } = await supabaseClient.from('productos_config').select('*');
+  if (error) { log('Error cargando productos_config: ' + error.message, true); return; }
+  productosConfig = data;
+  llenarSelects();
+  await refrescarResumen();
+}
+
+function llenarSelects() {
+  const opciones = productosConfig.map(p => `<option value="${p.producto}">${p.producto} (${p.unidad})</option>`).join('');
+  document.getElementById('c_producto').innerHTML = opciones;
+  document.getElementById('u_producto').innerHTML = opciones;
+  mostrarDuracionOficial();
+}
+
+function mostrarDuracionOficial() {
+  const producto = document.getElementById('c_producto').value;
+  const config = productosConfig.find(p => p.producto === producto);
+  document.getElementById('c_duracion_oficial').textContent = config ? `dura ${config.vida_util_dias} días de fábrica` : '';
+}
+
+document.getElementById('c_producto').addEventListener('change', mostrarDuracionOficial);
+
+function log(msg, esError = false) {
+  const el = document.getElementById('log');
+  el.textContent = msg;
+  el.style.color = esError ? '#b00020' : '#555';
+}
+
+// ====== COMPRAR ======
+document.getElementById('formComprar').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const producto = document.getElementById('c_producto').value;
+  const cantidad = redondearMedio(parseFloat(document.getElementById('c_cantidad').value));
+  const fechaCompra = document.getElementById('c_fecha').value;
+  const config = productosConfig.find(p => p.producto === producto);
+  const fechaVencimiento = sumarDias(fechaCompra, config.vida_util_dias);
+
+  const { error } = await supabaseClient.from('lotes').insert({
+    producto, cantidad_actual: cantidad, fecha_compra: fechaCompra, fecha_vencimiento: fechaVencimiento
+  });
+
+  if (error) { log('Error al comprar: ' + error.message, true); return; }
+  log(`Compraste ${cantidad} de ${producto}, vence ${formatFecha(fechaVencimiento)}`);
+  e.target.reset();
+  await refrescarResumen();
+});
+
+// ====== USAR ======
+document.getElementById('formUsar').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const producto = document.getElementById('u_producto').value;
+  const cantidad = redondearMedio(parseFloat(document.getElementById('u_cantidad').value));
+  const fechaUso = document.getElementById('u_fecha').value;
+
+  // 1. Buscar lote FIFO: el de fecha_vencimiento más próxima con stock > 0
+  const { data: lotes, error: errLotes } = await supabaseClient
+    .from('lotes')
+    .select('*')
+    .eq('producto', producto)
+    .gt('cantidad_actual', 0)
+    .order('fecha_vencimiento', { ascending: true })
+    .limit(1);
+
+  if (errLotes || !lotes || lotes.length === 0) {
+    log('No hay stock disponible de ' + producto, true);
+    return;
+  }
+  const lote = lotes[0];
+
+  if (cantidad > lote.cantidad_actual) {
+    log(`No hay suficiente en el lote más próximo (${lote.cantidad_actual} disponible). Ejercicio no maneja split entre lotes.`, true);
+    return;
+  }
+
+  // 2. Restar cantidad del lote
+  const nuevaCantidad = lote.cantidad_actual - cantidad;
+  await supabaseClient.from('lotes').update({ cantidad_actual: nuevaCantidad }).eq('id', lote.id);
+
+  // 3. Registrar el uso
+  await supabaseClient.from('usos').insert({ lote_id: lote.id, cantidad_usada: cantidad, fecha_uso: fechaUso });
+
+  log(`Uso registrado: ${cantidad} de ${producto} (lote vence ${formatFecha(lote.fecha_vencimiento)})`);
+  e.target.reset();
+
+  // 4. Recalcular stock total y días a vencer, usando fechaUso como "hoy simulado"
+  await evaluarAlerta(producto, fechaUso);
+  await refrescarResumen();
+});
+
+// ====== ALERTA ======
+async function evaluarAlerta(producto, fechaSimulada) {
+  const config = productosConfig.find(p => p.producto === producto);
+  const { data: todosLotes } = await supabaseClient.from('lotes').select('*').eq('producto', producto);
+
+  const stockTotal = todosLotes.reduce((sum, l) => sum + Number(l.cantidad_actual), 0);
+  const loteMasProximo = todosLotes
+    .filter(l => l.cantidad_actual > 0)
+    .sort((a, b) => new Date(a.fecha_vencimiento) - new Date(b.fecha_vencimiento))[0];
+
+  const diasAVencer = loteMasProximo
+    ? Math.floor((new Date(loteMasProximo.fecha_vencimiento) - new Date(fechaSimulada)) / 86400000)
+    : null;
+
+  const alertaCantidad = stockTotal < config.umbral_cantidad;
+  const alertaVencimiento = diasAVencer !== null && diasAVencer < config.dias_alerta_vencimiento;
+
+  if (alertaCantidad || alertaVencimiento) {
+    const motivo = alertaCantidad && alertaVencimiento
+      ? 'cantidad y vencimiento'
+      : alertaCantidad ? 'cantidad' : 'vencimiento';
+
+    await enviarAlerta({ producto, stockTotal, diasAVencer, motivo, fechaSimulada });
+  }
+}
+
+async function enviarAlerta(payload) {
+  if (MAKE_WEBHOOK_URL.includes('PEGA_AQUI')) {
+    log(`⚠ Alerta detectada (${payload.motivo}) pero falta configurar MAKE_WEBHOOK_URL en el código.`, true);
+    return;
+  }
+  try {
+    await fetch(MAKE_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    mostrarBadgeEnvio(payload.producto);
+  } catch (err) {
+    log('Error enviando webhook a Make: ' + err.message, true);
+  }
+}
+
+function mostrarBadgeEnvio(producto) {
+  const el = document.getElementById('log');
+  el.innerHTML = `<span class="badge-envio">📧 Correo enviado a compras: ${producto}</span>`;
+}
+
+// ====== RESUMEN ======
+async function refrescarResumen() {
+  const tbody = document.querySelector('#tablaResumen tbody');
+  tbody.innerHTML = '';
+
+  for (const config of productosConfig) {
+    const { data: lotes } = await supabaseClient.from('lotes').select('*').eq('producto', config.producto).order('fecha_vencimiento', { ascending: true });
+    const lotesConStock = (lotes || []).filter(l => l.cantidad_actual > 0);
+    const stockTotal = redondearMedio(lotesConStock.reduce((sum, l) => sum + Number(l.cantidad_actual), 0));
+    const loteProximo = lotesConStock[0];
+
+    const bajoUmbral = stockTotal < config.umbral_cantidad;
+    const estado = bajoUmbral ? '<span class="alerta">⚠ stock bajo</span>' : '<span class="ok">ok</span>';
+
+    const detalleFilas = lotesConStock.map(l =>
+      `<tr class="detalle-lote" data-producto-detalle="${config.producto}" style="display:none"><td></td><td colspan="4">${redondearMedio(l.cantidad_actual)} ${config.unidad}(s) — vence ${formatFecha(l.fecha_vencimiento)}</td></tr>`
+    ).join('') || `<tr class="detalle-lote" data-producto-detalle="${config.producto}" style="display:none"><td></td><td colspan="4">sin lotes con stock</td></tr>`;
+
+    tbody.innerHTML += `
+      <tr class="fila-producto" data-producto="${config.producto}" style="cursor:pointer">
+        <td><span class="triangulo">▶</span> ${config.producto}</td>
+        <td>${stockTotal} ${config.unidad}(s)</td>
+        <td>${loteProximo ? redondearMedio(loteProximo.cantidad_actual) + ' ' + config.unidad : '—'}</td>
+        <td>${loteProximo ? formatFecha(loteProximo.fecha_vencimiento) : '—'}</td>
+        <td>${estado}</td>
+      </tr>
+      ${detalleFilas}`;
+  }
+
+  document.querySelectorAll('.fila-producto').forEach(fila => {
+    fila.addEventListener('click', () => {
+      const producto = fila.dataset.producto;
+      const detalles = document.querySelectorAll(`[data-producto-detalle="${producto}"]`);
+      const triangulo = fila.querySelector('.triangulo');
+      const abierto = detalles[0].style.display !== 'none';
+      detalles.forEach(d => d.style.display = abierto ? 'none' : '');
+      triangulo.textContent = abierto ? '▶' : '▼';
+    });
+  });
+}
+
+function redondearMedio(n) {
+  return Math.round(n * 2) / 2;
+}
+
+function sumarDias(fechaISO, dias) {
+  const d = new Date(fechaISO);
+  d.setDate(d.getDate() + dias);
+  return d.toISOString().split('T')[0];
+}
+
+function formatFecha(fechaISO) {
+  if (!fechaISO) return '—';
+  const meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+  const [y, m, d] = fechaISO.split('-');
+  return `${parseInt(d)}-${meses[parseInt(m)-1]}-${y}`;
+}
+
+init();
+</script>
+</body>
+</html>
