@@ -182,25 +182,30 @@ async function evaluarAlerta(producto, fechaSimulada) {
 }
 
 async function construirMensajeAlerta(producto, stockTotal, config, alertaCantidad, alertaVencimiento) {
-  let lineas = [];
+  let intro = [];
   if (alertaCantidad) {
-    lineas.push(`Solo quedan ${redondearMedio(stockTotal)} ${config.unidad}(s) de ${producto}. Se sugiere comprar ${config.cantidad_reposicion_default || (config.umbral_cantidad * 2)} ${config.unidad}(s).`);
+    intro.push(`Solo quedan ${redondearMedio(stockTotal)} ${config.unidad}(s) de ${producto}. Se sugiere comprar ${config.cantidad_reposicion_default || (config.umbral_cantidad * 2)} ${config.unidad}(s).`);
   }
   if (alertaVencimiento) {
-    lineas.push(`${producto} tiene stock que vence pronto.`);
+    intro.push(`${producto} tiene stock que vence pronto.`);
   }
 
   const { data: todosLotes } = await supabaseClient.from('lotes').select('*').gt('cantidad_actual', 0);
   const proximos = todosLotes
     .sort((a, b) => new Date(a.fecha_vencimiento) - new Date(b.fecha_vencimiento))
-    .slice(0, 3)
-    .map(l => `- ${l.producto}: ${redondearMedio(l.cantidad_actual)} (vence ${formatFecha(l.fecha_vencimiento)})`);
+    .slice(0, 3);
 
-  lineas.push('');
-  lineas.push('Próximos 3 productos a vencer:');
-  lineas.push(...proximos);
+  const filasTabla = proximos.map(l =>
+    `<tr><td style="padding:4px 10px;border:1px solid #ddd">${l.producto}</td><td style="padding:4px 10px;border:1px solid #ddd">${redondearMedio(l.cantidad_actual)}</td><td style="padding:4px 10px;border:1px solid #ddd">${formatFecha(l.fecha_vencimiento)}</td></tr>`
+  ).join('');
 
-  return lineas.join('\n');
+  return `
+    <p>${intro.join('<br>')}</p>
+    <p><strong>Próximos 3 productos a vencer:</strong></p>
+    <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+      <tr><th style="padding:4px 10px;border:1px solid #ddd;text-align:left">Producto</th><th style="padding:4px 10px;border:1px solid #ddd;text-align:left">Cantidad</th><th style="padding:4px 10px;border:1px solid #ddd;text-align:left">Vence</th></tr>
+      ${filasTabla}
+    </table>`;
 }
 
 async function enviarAlerta(payload) {
