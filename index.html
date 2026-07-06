@@ -125,32 +125,28 @@ document.getElementById('formUsar').addEventListener('submit', async (e) => {
     .select('*')
     .eq('producto', producto)
     .gt('cantidad_actual', 0)
-    .order('fecha_vencimiento', { ascending: true });
+    .order('fecha_vencimiento', { ascending: true })
+    .limit(1);
 
   if (errLotes || !lotes || lotes.length === 0) {
     log('No hay stock disponible de ' + producto, true);
     return;
   }
+  const lote = lotes[0];
 
-  const stockDisponible = lotes.reduce((sum, l) => sum + Number(l.cantidad_actual), 0);
-  if (cantidad > stockDisponible) {
-    log(`Solo hay ${redondearMedio(stockDisponible)} ${producto} disponible en total.`, true);
+  if (cantidad > lote.cantidad_actual) {
+    log(`No hay suficiente en el lote más próximo (${lote.cantidad_actual} disponible). Ejercicio no maneja split entre lotes.`, true);
     return;
   }
 
-  let restante = cantidad;
-  const lotesUsados = [];
-  for (const lote of lotes) {
-    if (restante <= 0) break;
-    const usarDeEsteLote = Math.min(restante, Number(lote.cantidad_actual));
-    const nuevaCantidad = Number(lote.cantidad_actual) - usarDeEsteLote;
-    await supabaseClient.from('lotes').update({ cantidad_actual: nuevaCantidad }).eq('id', lote.id);
-    await supabaseClient.from('usos').insert({ lote_id: lote.id, cantidad_usada: usarDeEsteLote, fecha_uso: fechaUso });
-    lotesUsados.push(`${usarDeEsteLote} (vence ${formatFecha(lote.fecha_vencimiento)})`);
-    restante -= usarDeEsteLote;
-  }
+  // 2. Restar cantidad del lote
+  const nuevaCantidad = lote.cantidad_actual - cantidad;
+  await supabaseClient.from('lotes').update({ cantidad_actual: nuevaCantidad }).eq('id', lote.id);
 
-  log(`Uso registrado: ${cantidad} de ${producto} — ${lotesUsados.join(', ')}`);
+  // 3. Registrar el uso
+  await supabaseClient.from('usos').insert({ lote_id: lote.id, cantidad_usada: cantidad, fecha_uso: fechaUso });
+
+  log(`Uso registrado: ${cantidad} de ${producto} (lote vence ${formatFecha(lote.fecha_vencimiento)})`);
   e.target.reset();
 
   // 4. Recalcular stock total y días a vencer, usando fechaUso como "hoy simulado"
@@ -176,12 +172,31 @@ async function evaluarAlerta(producto, fechaSimulada) {
   const alertaVencimiento = diasAVencer !== null && diasAVencer < config.dias_alerta_vencimiento;
 
   if (alertaCantidad || alertaVencimiento) {
-    const motivo = alertaCantidad && alertaVencimiento
-      ? 'cantidad y vencimiento'
-      : alertaCantidad ? 'cantidad' : 'vencimiento';
-
-    await enviarAlerta({ producto, stockTotal, diasAVencer, motivo, fechaSimulada });
+    const mensaje = await construirMensajeAlerta(producto, stockTotal, config, alertaCantidad, alertaVencimiento);
+    await enviarAlerta({ producto, mensaje });
   }
+}
+
+async function construirMensajeAlerta(producto, stockTotal, config, alertaCantidad, alertaVencimiento) {
+  let lineas = [];
+  if (alertaCantidad) {
+    lineas.push(`Solo quedan ${redondearMedio(stockTotal)} ${config.unidad}(s) de ${producto}. Se sugiere comprar ${config.cantidad_reposicion_default || (config.umbral_cantidad * 2)} ${config.unidad}(s).`);
+  }
+  if (alertaVencimiento) {
+    lineas.push(`${producto} tiene stock que vence pronto.`);
+  }
+
+  const { data: todosLotes } = await supabaseClient.from('lotes').select('*').gt('cantidad_actual', 0);
+  const proximos = todosLotes
+    .sort((a, b) => new Date(a.fecha_vencimiento) - new Date(b.fecha_vencimiento))
+    .slice(0, 3)
+    .map(l => `- ${l.producto}: ${redondearMedio(l.cantidad_actual)} (vence ${formatFecha(l.fecha_vencimiento)})`);
+
+  lineas.push('');
+  lineas.push('Próximos 3 productos a vencer:');
+  lineas.push(...proximos);
+
+  return lineas.join('\n');
 }
 
 async function enviarAlerta(payload) {
