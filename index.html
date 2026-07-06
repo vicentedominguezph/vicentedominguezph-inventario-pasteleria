@@ -125,28 +125,32 @@ document.getElementById('formUsar').addEventListener('submit', async (e) => {
     .select('*')
     .eq('producto', producto)
     .gt('cantidad_actual', 0)
-    .order('fecha_vencimiento', { ascending: true })
-    .limit(1);
+    .order('fecha_vencimiento', { ascending: true });
 
   if (errLotes || !lotes || lotes.length === 0) {
     log('No hay stock disponible de ' + producto, true);
     return;
   }
-  const lote = lotes[0];
 
-  if (cantidad > lote.cantidad_actual) {
-    log(`No hay suficiente en el lote más próximo (${lote.cantidad_actual} disponible). Ejercicio no maneja split entre lotes.`, true);
+  const stockDisponible = lotes.reduce((sum, l) => sum + Number(l.cantidad_actual), 0);
+  if (cantidad > stockDisponible) {
+    log(`Solo hay ${redondearMedio(stockDisponible)} ${producto} disponible en total.`, true);
     return;
   }
 
-  // 2. Restar cantidad del lote
-  const nuevaCantidad = lote.cantidad_actual - cantidad;
-  await supabaseClient.from('lotes').update({ cantidad_actual: nuevaCantidad }).eq('id', lote.id);
+  let restante = cantidad;
+  const lotesUsados = [];
+  for (const lote of lotes) {
+    if (restante <= 0) break;
+    const usarDeEsteLote = Math.min(restante, Number(lote.cantidad_actual));
+    const nuevaCantidad = Number(lote.cantidad_actual) - usarDeEsteLote;
+    await supabaseClient.from('lotes').update({ cantidad_actual: nuevaCantidad }).eq('id', lote.id);
+    await supabaseClient.from('usos').insert({ lote_id: lote.id, cantidad_usada: usarDeEsteLote, fecha_uso: fechaUso });
+    lotesUsados.push(`${usarDeEsteLote} (vence ${formatFecha(lote.fecha_vencimiento)})`);
+    restante -= usarDeEsteLote;
+  }
 
-  // 3. Registrar el uso
-  await supabaseClient.from('usos').insert({ lote_id: lote.id, cantidad_usada: cantidad, fecha_uso: fechaUso });
-
-  log(`Uso registrado: ${cantidad} de ${producto} (lote vence ${formatFecha(lote.fecha_vencimiento)})`);
+  log(`Uso registrado: ${cantidad} de ${producto} — ${lotesUsados.join(', ')}`);
   e.target.reset();
 
   // 4. Recalcular stock total y días a vencer, usando fechaUso como "hoy simulado"
